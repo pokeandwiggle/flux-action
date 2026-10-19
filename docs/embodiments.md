@@ -28,4 +28,13 @@ the fp32 master weights. For a policy that conditions on one frame, `PolicyConfi
 encodes that frame alone instead of padding it to the VAE’s 45-frame chunk. This changes the encoded
 latents and is off by default; retain the setting used by your checkpoint.
 
+## Real-time chunking
+
+A robot that replans while it still executes the previous chunk has already committed to its first few
+actions. **`rtc_max_delay`** trains for that: each window draws `d` uniformly from `0..rtc_max_delay`,
+keeps its first `d` action tokens clean (timestep 0) and leaves them out of the loss. At inference,
+`predict_action_chunk(batch, action_prefix=...)` takes those committed commands, `(B, d, D)` in dataset units
+with `d <= rtc_max_delay`; every denoiser call sees them clean and the chunk returns them unchanged. It needs
+the reference transformer (an unprepared policy) and the absolute action parameterization.
+
 [`examples/games`](../examples/games/README.md) does all of the above on two browser games.

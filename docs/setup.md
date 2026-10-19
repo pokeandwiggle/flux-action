@@ -358,7 +358,9 @@ external references and are not checksummed. They contain no training state.
 it integrates predicted deltas onto measured state. `select_action` queues `n_action_steps`
 commands before replanning and continues joint deltas from the last returned command.
 Call `reset` at episode boundaries, interventions or task/batch changes. The application owns
-control timing and execution; RTC arguments are unsupported.
+control timing and execution. A policy trained with `rtc_max_delay` (see
+[real-time chunking](embodiments.md#real-time-chunking)) also takes `action_prefix`: the
+commands already committed from this observation on, which the chunk starts with.
 
 ### Camera layouts
 

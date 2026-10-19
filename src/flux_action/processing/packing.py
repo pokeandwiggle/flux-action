@@ -410,8 +410,24 @@ def sample_timesteps(
     return rational_time_shift(t, shift)
 
 
+def sample_rtc_delays(batch: int, max_delay: int, generator: torch.Generator | None = None) -> Tensor:
+    """Train-time real-time chunking: one prefix length ``d`` per sample, uniform over ``0..max_delay``."""
+    return torch.randint(0, max_delay + 1, (batch,), generator=generator)
+
+
+def prefix_timesteps(t: Tensor, delays: Tensor, chunk: int) -> Tensor:
+    """Per-token action timesteps ``(B, chunk)``: ``0`` (clean) on each sample's first ``delays`` tokens, else ``t``."""
+    pinned = torch.arange(chunk)[None] < delays[:, None]
+    return torch.where(pinned, torch.zeros((), dtype=t.dtype), t[:, None])
+
+
+def prefix_loss_mask(delays: Tensor, chunk: int) -> Tensor:
+    """``(B, chunk)``, 1 on the action tokens that are denoised and 0 on each sample's clean prefix."""
+    return (torch.arange(chunk)[None] >= delays[:, None]).float()
+
+
 def add_noise(x0: Tensor, t: Tensor, generator: torch.Generator | None = None) -> tuple[Tensor, Tensor]:
-    """``x_t = t * eps + (1 - t) * x0``; velocity target ``eps - x0``. ``t`` is ``(B,)``.
+    """``x_t = t * eps + (1 - t) * x0``; velocity target ``eps - x0``. ``t`` is ``(B,)`` or per token ``(B, L)``.
 
     Everything is computed in ``x0.dtype`` after rounding ``t`` and ``eps`` to it: the reference packs
     latents, noise and timesteps in bfloat16 and noises in that dtype, so a bf16 window sees ``t`` on
@@ -420,7 +436,7 @@ def add_noise(x0: Tensor, t: Tensor, generator: torch.Generator | None = None) -
     eps_ = torch.randn(x0.shape, generator=generator, dtype=torch.float32).to(
         device=x0.device, dtype=x0.dtype
     )
-    tt = t.to(device=x0.device, dtype=x0.dtype).view(-1, *([1] * (x0.ndim - 1)))
+    tt = t.to(device=x0.device, dtype=x0.dtype).view(*t.shape, *([1] * (x0.ndim - t.ndim)))
     x_t = tt * eps_ + (1 - tt) * x0
     return x_t, eps_ - x0
 
@@ -439,7 +455,8 @@ def build_forward_kwargs(
     """Assemble one training call: ``(forward_kwargs, flow_targets, clean_latents)``.
 
     Conditioning streams (``x_video_cond``, ``x_<modality>_cond``) stay clean at timestep 0. Predicted
-    streams use ``t`` and optionally separate ``action_timesteps``, rounded to their latent dtype.
+    streams use ``t`` and optionally separate ``action_timesteps``, ``(B,)`` or per token ``(B, K)``
+    (see :func:`prefix_timesteps`), rounded to their latent dtype.
     Optional conditioning noise applies only to visual snapshots; state/command history stays clean.
     The timesteps handed to the model are fp32 tensors holding the rounded values.
     """
@@ -456,7 +473,8 @@ def build_forward_kwargs(
         "x_video_timesteps": tt[:, None] * torch.ones(xv.shape[:2], device=dev),
         ak: xa,
         f"{ak}_ids": action[f"{ak}_ids"].to(dev),
-        f"{ak}_timesteps": tt_action[:, None] * torch.ones(xa.shape[:2], device=dev),
+        f"{ak}_timesteps": (tt_action if tt_action.ndim == 2 else tt_action[:, None])
+        * torch.ones(xa.shape[:2], device=dev),
         "x_video_cond": video["x_video_cond"],
         "x_video_cond_ids": video["x_video_cond_ids"].to(dev),
         "x_video_cond_timesteps": torch.zeros(video["x_video_cond"].shape[:2], device=dev),
@@ -524,6 +542,7 @@ def flow_loss(
     video_weight: float = VIDEO_LOSS_WEIGHT,
     *,
     action_mask: Tensor | None = None,
+    action_token_mask: Tensor | None = None,
     reduction: str = "joint_tokens",
     channel_weights: list[float] | None = None,
 ) -> dict[str, Tensor]:
@@ -538,6 +557,9 @@ def flow_loss(
     ``action_mask`` ``(n, D)`` (1 = trained dim) restricts the per-token action MSE to the given dims of each
     window, for a head shared by embodiments of different action widths (padded dims carry no loss). The
     action tokens are laid out window-major in the packed sequence, ``n`` windows x ``K`` tokens each.
+
+    ``action_token_mask`` ``(n, K)`` (1 = trained token) drops whole action tokens from the loss and from the
+    joint-token count, e.g. a real-time-chunking prefix held clean (:func:`prefix_loss_mask`).
     """
     ak = f"x_{modality}"
     video = ((pred["x_video"].float() - targets["x_video"].float()) ** 2).mean(-1)  # (B, Nv)
@@ -561,15 +583,24 @@ def flow_loss(
             if action_mask is None
             else (sq * weights * m).sum(-1) / m.sum(-1).clamp_min(1.0)
         )
+    if action_token_mask is None:
+        action_sum, action_count, action_mse = weighted_action.sum(), action.numel(), action.mean()
+    else:
+        # window-major like the tokens, so (n, K) reshapes onto batched (n, K) and packed (1, n * K) alike
+        w = action_token_mask.to(device=action.device, dtype=torch.float32).reshape(action.shape)
+        action_count = w.sum()
+        action_sum = (weighted_action * w).sum()
+        action_mse = (action * w).sum() / action_count.clamp_min(1.0)
     if reduction == "modalities":
-        total = video_weight * video.mean() + action_weight * weighted_action.mean()
-    elif reduction == "joint_tokens":
-        total = (video_weight * video.sum() + action_weight * weighted_action.sum()) / (
-            video.numel() + action.numel()
+        mean = (
+            weighted_action.mean() if action_token_mask is None else action_sum / action_count.clamp_min(1.0)
         )
+        total = video_weight * video.mean() + action_weight * mean
+    elif reduction == "joint_tokens":
+        total = (video_weight * video.sum() + action_weight * action_sum) / (video.numel() + action_count)
     else:
         raise ValueError(f"unknown loss reduction {reduction!r}")
-    return {"loss": total, "video_mse": video.mean().detach(), "action_mse": action.mean().detach()}
+    return {"loss": total, "video_mse": video.mean().detach(), "action_mse": action_mse.detach()}
 
 
 def token_budget(

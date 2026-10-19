@@ -663,6 +663,11 @@ class FluxActionPolicy(nn.Module):
         action_timesteps = timesteps
         if cfg.separate_timesteps:
             timesteps = torch.sigmoid(torch.randn(n) * cfg.video_logit_std + cfg.video_logit_mean)
+        prefix_mask = None
+        if cfg.rtc_max_delay and self.training:
+            delays = packing.sample_rtc_delays(n, cfg.rtc_max_delay)
+            action_timesteps = packing.prefix_timesteps(action_timesteps, delays, cfg.chunk_size)
+            prefix_mask = packing.prefix_loss_mask(delays, cfg.chunk_size)
         kwargs, targets, _ = packing.build_forward_kwargs(
             video,
             action,
@@ -685,6 +690,7 @@ class FluxActionPolicy(nn.Module):
             cfg.action_loss_weight,
             cfg.video_loss_weight,
             action_mask=prepared.action_mask,
+            action_token_mask=prefix_mask,
             reduction=cfg.loss_reduction,
             channel_weights=cfg.action_channel_weights,
         )
@@ -783,9 +789,23 @@ class FluxActionPolicy(nn.Module):
         }
 
     @torch.no_grad()
-    def _sample(self, cond: dict[str, Tensor], caption: str, seed: int) -> Tensor:
-        """Joint video + action denoising from pure noise -> ``(chunk, D)`` in model units / action_scale."""
+    def _sample(
+        self, cond: dict[str, Tensor], caption: str, seed: int, prefix: Tensor | None = None
+    ) -> Tensor:
+        """Joint video + action denoising from pure noise -> ``(chunk, D)`` in model units / action_scale.
+
+        ``prefix`` ``(d, D)``, normalized targets, pins the chunk's first ``d`` actions: every denoiser call
+        sees them clean at timestep 0, as ``rtc_max_delay`` training does, and they are returned verbatim.
+        """
         cfg, m, mdt = self.config, self.modality, self.dtype_
+        if prefix is not None:
+            if not 1 <= prefix.shape[0] <= cfg.rtc_max_delay or prefix.shape[1:] != (cfg.action_dim,):
+                raise ValueError(
+                    f"an action prefix is (1..{cfg.rtc_max_delay}, {cfg.action_dim}) for this checkpoint "
+                    f"(rtc_max_delay {cfg.rtc_max_delay}), got {tuple(prefix.shape)}"
+                )
+            if self._inference_prepared:
+                raise NotImplementedError("action prefixes need the reference DiT, not a prepared backend")
         ak, ck = f"x_{m}", f"x_{m}_cond"
         device = cond["x_video_cond"].device
         rich_history = cfg.inference_profile == "history"
@@ -847,13 +867,19 @@ class FluxActionPolicy(nn.Module):
             )
 
         assert isinstance(self.dit, JointSingleSeq), "call prepare_inference before prediction"
+        d = 0 if prefix is None else prefix.shape[0]
+        pinned = None if prefix is None else (prefix.to(device, torch.float32) * cfg.action_scale)[None]
 
         def predict(samples: dict[str, Tensor], t) -> dict[str, Tensor]:
             t = float(t) / 1000.0 if isinstance(t, Tensor) and not t.is_floating_point() else float(t)
+            action_t = torch.full((1, cfg.chunk_size), t, device=device)
+            action_t[:, :d] = 0.0
             timesteps = {
                 "x_video_timesteps": torch.full((1, samples["x_video"].shape[1]), t, device=device),
-                f"{ak}_timesteps": torch.full((1, cfg.chunk_size), t, device=device),
+                f"{ak}_timesteps": action_t,
             }
+            if pinned is not None:
+                samples = {**samples, ak: torch.cat([pinned, samples[ak][:, d:]], dim=1)}
             model_in = {k: v.to(mdt) for k, v in samples.items()}
             if ctx_uc is None:  # guidance 1.0 on every stream: a single conditional pass
                 ctx, ctx_ids = ctx_c
@@ -876,7 +902,10 @@ class FluxActionPolicy(nn.Module):
             )
         else:
             out = sampling.euler(flow, predict, n_steps=cfg.num_inference_steps, alpha=cfg.sampler_shift)
-        return out[ak][0].float() / cfg.action_scale
+        targets = out[ak][0].float() / cfg.action_scale
+        if prefix is not None:
+            targets[:d] = prefix.to(targets.device, torch.float32)
+        return targets
 
     def _prepared_text(self, caption: str, ctx: tuple[Tensor, Tensor], vector: Tensor):
         cached = self._prepared_text_cache.get(caption)
@@ -960,9 +989,14 @@ class FluxActionPolicy(nn.Module):
         return self._action_targets(actions, previous)
 
     @torch.no_grad()
-    def predict_normalized_targets(self, batch: dict[str, Any]) -> Tensor:
+    def predict_normalized_targets(
+        self, batch: dict[str, Any], *, target_prefix: Tensor | None = None
+    ) -> Tensor:
         """Observation batch -> ``(B, chunk_size, action_dim)`` predicted targets in the trained action space:
-        normalized, deltas under ``joint_delta``, before denormalization and integration."""
+        normalized, deltas under ``joint_delta``, before denormalization and integration.
+
+        ``target_prefix`` ``(B, d, action_dim)`` in the same space pins each chunk's first ``d`` targets (real-time
+        chunking; ``d`` at most the checkpoint's ``rtc_max_delay``); they come back verbatim."""
         self.config.validate_inference()
         if self._inference_prepared and self.dit._compiled_hot is not None:
             torch.compiler.cudagraph_mark_step_begin()
@@ -993,10 +1027,17 @@ class FluxActionPolicy(nn.Module):
         assert cams.shape[0] == b and cams.device == state.device, "observation batch mismatch"
         captions = self._captions(batch, b)
         token = self._normalize_state(state)
+        if target_prefix is not None and target_prefix.shape[0] != b:
+            raise ValueError(f"target_prefix holds {target_prefix.shape[0]} chunks for a batch of {b}")
         targets = []
         for i in range(b):
             cond = self._encode_observation(cams[i], token[i : i + 1])
-            targets.append(self._sample(cond, captions[i], self.config.inference_seed))
+            seed = self.config.inference_seed
+            targets.append(
+                self._sample(cond, captions[i], seed)
+                if target_prefix is None
+                else self._sample(cond, captions[i], seed, target_prefix[i])
+            )
         return torch.stack(targets)
 
     @torch.no_grad()
@@ -1008,19 +1049,32 @@ class FluxActionPolicy(nn.Module):
         return self._flip(torch.stack(chunks)).float()
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Any], **kwargs: Any) -> Tensor:
+    def predict_action_chunk(
+        self, batch: dict[str, Any], *, action_prefix: Tensor | None = None, **kwargs: Any
+    ) -> Tensor:
         """Observation batch -> ``(B, chunk_size, action_dim)`` absolute commands in the dataset's action units.
 
         Normalization is undone and, under ``joint_delta``, the predicted deltas are integrated onto the
         observed state, so the result is what the dataset's action column holds (gripper as stored).
+
+        ``action_prefix`` ``(B, d, action_dim)``, commands in the same units, are the actions already committed
+        from this observation on: the chunk starts with them (real-time chunking, for checkpoints trained with
+        ``rtc_max_delay >= d``) and returns them unchanged. Absolute action parameterization only.
         """
         if kwargs:
-            raise NotImplementedError("FLUX Action does not implement RTC inference arguments yet")
+            raise NotImplementedError(f"FLUX Action does not implement inference arguments {sorted(kwargs)}")
         if self.config.inference_profile == "history":
+            if action_prefix is not None:
+                raise NotImplementedError("action prefixes require the default inference profile")
             batch = history.observation_window(batch, self.config)
             targets = self.predict_normalized_targets(batch)
             return self.actions_from_targets(targets, batch["command_history"][:, -1])
-        targets = self.predict_normalized_targets(batch)
+        target_prefix = None
+        if action_prefix is not None:
+            if self.config.action_parameterization != "absolute":
+                raise NotImplementedError("action prefixes require the absolute action parameterization")
+            target_prefix = self._action_targets(self._flip(action_prefix.float()), None)
+        targets = self.predict_normalized_targets(batch, target_prefix=target_prefix)
         return self.actions_from_targets(targets, self._state(batch))
 
     @torch.no_grad()
