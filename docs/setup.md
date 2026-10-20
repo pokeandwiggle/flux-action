@@ -443,7 +443,9 @@ The video VAE automatically selects its NATTEN backend; `F3_NATTEN_BACKEND` over
 ### Precision
 
 The selected package's `quantization` field chooses BF16 or prequantized FP8r weights;
-there is no runtime quantization flag. FP8r quantizes linear inputs rowwise for GEMMs,
+there is no runtime quantization flag. A BF16 fine-tune of the released DiT architecture, with
+its own action stream and width, quantizes to FP8r in place with `policy.quantize_fp8r()` before
+placement and `prepare_inference()`. FP8r quantizes linear inputs rowwise for GEMMs,
 while attention and boundary operations stay BF16. Sampler state and timesteps stay
 float32. Use `bfloat16` or `keep` for FP8r serving dtype.
 For BF16 exports, the server casts DiT weights on CPU before GPU placement; `--dtype keep`

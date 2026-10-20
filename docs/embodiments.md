@@ -35,6 +35,7 @@ actions. **`rtc_max_delay`** trains for that: each window draws `d` uniformly fr
 keeps its first `d` action tokens clean (timestep 0) and leaves them out of the loss. At inference,
 `predict_action_chunk(batch, action_prefix=...)` takes those committed commands, `(B, d, D)` in dataset units
 with `d <= rtc_max_delay`; every denoiser call sees them clean and the chunk returns them unchanged. It needs
-the reference transformer (an unprepared policy) and the absolute action parameterization.
+the absolute action parameterization, and either the reference transformer (an unprepared policy) or the FP8r
+backend (see [Precision](setup.md#precision)).
 
 [`examples/games`](../examples/games/README.md) does all of the above on two browser games.

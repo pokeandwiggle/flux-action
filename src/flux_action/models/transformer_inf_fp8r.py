@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Native rowwise-FP8 inference for the released DROID DiT.
+"""Native rowwise-FP8 inference for the released DROID DiT and fine-tunes of its architecture.
 
 Every transformer-block linear is loaded from an E4M3 weight and an FP32
 per-row scale. The published checkpoint also quantizes video/text boundaries,
 time/vector embedders, and non-action modulations; action boundaries and
-modulations plus RMSNorm weights remain BF16. Runtime activation quantization,
+modulations plus RMSNorm weights remain BF16. A fine-tune names its own action
+stream and width, and :meth:`FP8RInferenceDiT.from_bf16_state_dict` quantizes
+its BF16 weights the same way. Runtime activation quantization,
 Q/K RMSNorm plus RoPE, and SwiGLU are ordinary Torch expressions; matrix
 multiplication uses :func:`torch._scaled_mm`.
 """
@@ -36,9 +38,8 @@ VIDEO = "video"
 VIDEO_COND = "video_cond"
 ACTION = "action_prediction_droid"
 ACTION_COND = "action_prediction_droid_cond"
-_STREAMS = (VIDEO, VIDEO_COND, ACTION, ACTION_COND)
 _JOINT_STREAMS = ("txt", VIDEO, VIDEO_COND, ACTION, ACTION_COND)
-_CHANNELS = {VIDEO: 96, VIDEO_COND: 96, ACTION: 8, ACTION_COND: 8}
+VIDEO_CHANNELS = 96
 CONTEXT_DIM = 20480
 VECTOR_DIM = 768
 HIDDEN = 3072
@@ -51,22 +52,17 @@ MLP = 9216
 GEMM_ALIGNMENT = 256
 ROW_ALIGNMENT = 128
 
-_BF16_LINEAR_PREFIXES = (
-    f"emb_in.{ACTION}",
-    f"emb_in.{ACTION_COND}",
-    f"early_stream_modulations.{ACTION}",
-    f"early_stream_modulations.{ACTION_COND}",
-    f"single_stream_modulations.{ACTION}",
-    f"single_stream_modulations.{ACTION_COND}",
-    f"final_layer.{ACTION}",
-    f"final_layer.{ACTION_COND}",
-)
-
 ModulationTuple = tuple[Tensor, Tensor, Tensor]
 
 
-def _is_native_fp8r_weight(name: str) -> bool:
-    return name.endswith(".weight") and not name.startswith(_BF16_LINEAR_PREFIXES)
+def _is_native_fp8r_weight(name: str, action: str) -> bool:
+    """Every weight except the action stream's boundaries and modulations, which stay BF16."""
+    bf16_prefixes = tuple(
+        f"{module}.{stream}"
+        for module in ("emb_in", "early_stream_modulations", "single_stream_modulations", "final_layer")
+        for stream in (action, f"{action}_cond")
+    )
+    return name.endswith(".weight") and not name.startswith(bf16_prefixes)
 
 
 def _quantize_fp8r(value: Tensor) -> tuple[Tensor, Tensor]:
@@ -479,6 +475,8 @@ class _ModeBlock(nn.Module):
 
     def forward(self, x: Tensor, pe: Tensor, modulation: ModulationTuple, valid_length: int) -> Tensor:
         shift, scale, gate = modulation
+        if shift.shape[1] > 1:  # per-token modulation over the valid tokens; padding rows are discarded
+            shift, scale = _pad_to_tokens(shift, x.shape[1]), _pad_to_tokens(scale, x.shape[1])
         active = (1 + scale) * self.pre_norm(x) + shift
         batch, tokens = active.shape[:2]
         assert self.projections is not None, "mode projections are not packed"
@@ -586,10 +584,23 @@ class _LastLayer(nn.Module):
 
 
 class FP8RInferenceDiT(nn.Module):
-    """Released DROID architecture with owned packed FP8 weights and prepared state."""
+    """Released DROID architecture with owned packed FP8 weights and prepared state.
 
-    def __init__(self):
+    ``action`` names the action stream (``action_cond`` its conditioning stream) and ``action_channels`` is its
+    width: DROID's by default, a fine-tune's own otherwise.
+    """
+
+    def __init__(self, action: str = ACTION, action_channels: int = 8):
         super().__init__()
+        self.action = action
+        self.action_cond = f"{action}_cond"
+        streams = (VIDEO, VIDEO_COND, self.action, self.action_cond)
+        channels = {
+            VIDEO: VIDEO_CHANNELS,
+            VIDEO_COND: VIDEO_CHANNELS,
+            self.action: action_channels,
+            self.action_cond: action_channels,
+        }
         self._packed = False
         self._compiled_text = None
         self._compiled_observation = None
@@ -597,24 +608,24 @@ class FP8RInferenceDiT(nn.Module):
         self._compiled_hot = None
         self.pe_embedder = _EmbedND()
         self.emb_in = nn.ModuleDict(
-            {name: nn.Linear(width, HIDDEN, bias=False) for name, width in _CHANNELS.items()}
+            {name: nn.Linear(width, HIDDEN, bias=False) for name, width in channels.items()}
         )
         self.txt_in = nn.Linear(CONTEXT_DIM, HIDDEN, bias=False)
         self.time_in = _MLPEmbedder(256, HIDDEN)
         self.vector_in = _MLPEmbedder(VECTOR_DIM, HIDDEN)
         self.early_stream_modulations = nn.ModuleDict(
-            {name: _Modulation(HIDDEN) for name in (*_STREAMS, "txt")}
+            {name: _Modulation(HIDDEN) for name in (*streams, "txt")}
         )
         self.single_stream_modulations = nn.ModuleDict(
-            {name: _Modulation(HIDDEN) for name in (*_STREAMS, "txt")}
+            {name: _Modulation(HIDDEN) for name in (*streams, "txt")}
         )
         self.content_mode_blocks = nn.ModuleDict(
-            {name: nn.ModuleList([_ModeBlock() for _ in range(DEPTH)]) for name in _STREAMS}
+            {name: nn.ModuleList([_ModeBlock() for _ in range(DEPTH)]) for name in streams}
         )
         self.txt_mode_blocks = nn.ModuleList([_ModeBlock() for _ in range(DEPTH)])
         self.single_blocks = nn.ModuleList([_JointBlock() for _ in range(JOINT_DEPTH)])
         self.final_layer = nn.ModuleDict(
-            {name: _LastLayer(HIDDEN, width) for name, width in _CHANNELS.items()}
+            {name: _LastLayer(HIDDEN, width) for name, width in channels.items()}
         )
 
     @staticmethod
@@ -630,15 +641,35 @@ class FP8RInferenceDiT(nn.Module):
             )
 
     @classmethod
-    def from_quantized_state_dict(cls, state_dict: Mapping[str, Tensor]) -> FP8RInferenceDiT:
-        """Strictly load the released native-FP8r checkpoint without changing its payloads."""
+    @torch.no_grad()
+    def from_bf16_state_dict(
+        cls, state_dict: Mapping[str, Tensor], *, action: str = ACTION
+    ) -> FP8RInferenceDiT:
+        """Quantize a BF16 reference DiT of the released architecture, such as a fine-tune, as the released
+        fp8r packages store it: each native weight to E4M3 with an FP32 scale per output row."""
+        quantized: dict[str, Tensor] = {}
+        for key, value in state_dict.items():
+            if _is_native_fp8r_weight(key, action):
+                weight, scale = _quantize_fp8r(value.contiguous())
+                quantized[key] = weight
+                quantized[f"{key.removesuffix('.weight')}.weight_scale"] = scale
+            else:
+                quantized[key] = value
+        return cls.from_quantized_state_dict(quantized, action=action)
+
+    @classmethod
+    def from_quantized_state_dict(
+        cls, state_dict: Mapping[str, Tensor], *, action: str = ACTION
+    ) -> FP8RInferenceDiT:
+        """Strictly load a native-FP8r checkpoint without changing its payloads; the action stream's width is
+        read from its input projection."""
         devices = {value.device for value in state_dict.values()}
         assert len(devices) == 1, "weights need one device"
         base = {key: value for key, value in state_dict.items() if not key.endswith(".weight_scale")}
         scales = {key: value for key, value in state_dict.items() if key.endswith(".weight_scale")}
         expected_scales: set[str] = set()
         for key, value in base.items():
-            if not _is_native_fp8r_weight(key):
+            if not _is_native_fp8r_weight(key, action):
                 assert value.dtype == torch.bfloat16, "expected BF16 boundary weight"
             else:
                 assert value.dtype == torch.float8_e4m3fn, "expected E4M3 weight"
@@ -650,10 +681,10 @@ class FP8RInferenceDiT(nn.Module):
         assert set(scales) == expected_scales, "FP8r scale set mismatch"
 
         with torch.device("meta"):
-            model = cls()
+            model = cls(action, base[f"emb_in.{action}.weight"].shape[1])
         model.load_state_dict(base, strict=True, assign=True)
         del model.final_layer[VIDEO_COND]
-        del model.final_layer[ACTION_COND]
+        del model.final_layer[model.action_cond]
         model._pack_linears(scales)
         model.eval()
         return model
@@ -669,7 +700,7 @@ class FP8RInferenceDiT(nn.Module):
             for name, child in list(module.named_children()):
                 child_path = f"{path}.{name}" if path else name
                 weight_path = f"{child_path}.weight"
-                if isinstance(child, nn.Linear) and _is_native_fp8r_weight(weight_path):
+                if isinstance(child, nn.Linear) and _is_native_fp8r_weight(weight_path, self.action):
                     setattr(
                         module,
                         name,
@@ -708,7 +739,7 @@ class FP8RInferenceDiT(nn.Module):
                 convert(child, name)
             elif isinstance(child, nn.Linear):
                 weight_path = f"{name}.weight"
-                if _is_native_fp8r_weight(weight_path):
+                if _is_native_fp8r_weight(weight_path, self.action):
                     setattr(self, name, _FP8RLinear.pack(child, scale_for(weight_path)))
             else:
                 convert(child, name)
@@ -720,7 +751,7 @@ class FP8RInferenceDiT(nn.Module):
         return self
 
     def _weight_spec(self) -> tuple[torch.device, torch.dtype]:
-        action_input = self.emb_in[ACTION]
+        action_input = self.emb_in[self.action]
         assert self._packed and isinstance(action_input, nn.Linear), "native model is not packed"
         assert action_input.weight.dtype == torch.bfloat16, "expected BF16 action input"
         return action_input.weight.device, torch.bfloat16
@@ -770,10 +801,10 @@ class FP8RInferenceDiT(nn.Module):
         text_early = self.early_stream_modulations["txt"](static)
         condition_early = (
             self.early_stream_modulations[VIDEO_COND](static),
-            self.early_stream_modulations[ACTION_COND](static),
+            self.early_stream_modulations[self.action_cond](static),
         )
         static_joint = tuple(
-            self.single_stream_modulations[name](static) for name in ("txt", VIDEO_COND, ACTION_COND)
+            self.single_stream_modulations[name](static) for name in ("txt", VIDEO_COND, self.action_cond)
         )
         pe = self.pe_embedder(ctx_ids)
         text = _pad_sequence(self.txt_in(ctx), ROW_ALIGNMENT)
@@ -828,7 +859,7 @@ class FP8RInferenceDiT(nn.Module):
             self.pe_embedder(ids) for ids in (video_ids, video_cond_ids, action_ids, action_cond_ids)
         )
         video_value = _pad_sequence(self.emb_in[VIDEO_COND](video_cond), ROW_ALIGNMENT)
-        action_value = _pad_sequence(self.emb_in[ACTION_COND](action_cond), ROW_ALIGNMENT)
+        action_value = _pad_sequence(self.emb_in[self.action_cond](action_cond), ROW_ALIGNMENT)
         for block in self.content_mode_blocks[VIDEO_COND]:
             video_value = block(
                 video_value,
@@ -836,7 +867,7 @@ class FP8RInferenceDiT(nn.Module):
                 (video_shift, video_scale, video_gate),
                 video_cond.shape[1],
             )
-        for block in self.content_mode_blocks[ACTION_COND]:
+        for block in self.content_mode_blocks[self.action_cond]:
             action_value = block(
                 action_value,
                 ropes[3],
@@ -894,13 +925,13 @@ class FP8RInferenceDiT(nn.Module):
         video_vector = self._embed_time(video_timestep) + vector
         action_vector = self._embed_time(action_timestep) + vector
         video_early = self.early_stream_modulations[VIDEO](video_vector)
-        action_early = self.early_stream_modulations[ACTION](action_vector)
+        action_early = self.early_stream_modulations[self.action](action_vector)
         dynamic_joint = (
             self.single_stream_modulations[VIDEO](video_vector),
-            self.single_stream_modulations[ACTION](action_vector),
+            self.single_stream_modulations[self.action](action_vector),
         )
         video_final = self.final_layer[VIDEO].adaLN_modulation(video_vector)[:, None].chunk(2, dim=-1)
-        action_final = self.final_layer[ACTION].adaLN_modulation(action_vector)[:, None].chunk(2, dim=-1)
+        action_final = self.final_layer[self.action].adaLN_modulation(action_vector)[:, None].chunk(2, dim=-1)
         return (
             *video_early,
             *action_early,
@@ -923,13 +954,30 @@ class FP8RInferenceDiT(nn.Module):
         return value
 
     def _prepare_step(
-        self, request: _PreparedRequest, video_timestep: Tensor, action_timestep: Tensor
+        self,
+        request: _PreparedRequest,
+        video_timestep: Tensor,
+        action_timestep: Tensor,
+        clean_action_tokens: int,
     ) -> _PreparedStep:
         video_timestep = self._scalar_timestep(video_timestep, request)
         action_timestep = self._scalar_timestep(action_timestep, request)
         core = self._compiled_step or self._prepare_step_math
         values = core(request.vector, video_timestep, action_timestep)
         values = tuple(value.detach().clone() for value in values)
+        if clean_action_tokens:
+            # Real-time chunking: the first action tokens are clean, so their modulations are timestep 0's,
+            # per token as the reference DiT computes them. Indices 3:6, 9:12 and 14:16 are the action
+            # stream's early, joint and final modulations.
+            clean = core(request.vector, video_timestep, torch.zeros_like(action_timestep))
+            is_clean = (torch.arange(request.lengths[3], device=request.device) < clean_action_tokens)[
+                None, :, None
+            ]
+            action_values = (*range(3, 6), *range(9, 12), 14, 15)
+            values = tuple(
+                torch.where(is_clean, clean[index], value) if index in action_values else value
+                for index, value in enumerate(values)
+            )
         return _PreparedStep(
             tuple(values[0:3]),  # type: ignore[arg-type]
             tuple(values[3:6]),  # type: ignore[arg-type]
@@ -940,12 +988,20 @@ class FP8RInferenceDiT(nn.Module):
 
     @torch.no_grad()
     def prepare_steps(
-        self, request: _PreparedRequest, video_timesteps: Tensor, action_timesteps: Tensor
+        self,
+        request: _PreparedRequest,
+        video_timesteps: Tensor,
+        action_timesteps: Tensor,
+        *,
+        clean_action_tokens: int = 0,
     ) -> tuple[_PreparedStep, ...]:
+        """One prepared step per sampler timestep. The first ``clean_action_tokens`` action tokens are modulated
+        at timestep 0 instead, for a real-time-chunking prefix the caller pins clean in every call."""
         assert video_timesteps.ndim == action_timesteps.ndim == 1, "invalid timestep rank"
         assert video_timesteps.shape == action_timesteps.shape, "timestep shape mismatch"
+        assert 0 <= clean_action_tokens <= request.lengths[3], "more clean tokens than action tokens"
         return tuple(
-            self._prepare_step(request, video_timesteps[index], action_timesteps[index])
+            self._prepare_step(request, video_timesteps[index], action_timesteps[index], clean_action_tokens)
             for index in range(video_timesteps.numel())
         )
 
@@ -953,14 +1009,14 @@ class FP8RInferenceDiT(nn.Module):
         self, request: _PreparedRequest, step: _PreparedStep, video: Tensor, action: Tensor
     ) -> tuple[Tensor, Tensor]:
         video_value = _pad_sequence(self.emb_in[VIDEO](video), ROW_ALIGNMENT)
-        action_value = _pad_sequence(self.emb_in[ACTION](action), ROW_ALIGNMENT)
+        action_value = _pad_sequence(self.emb_in[self.action](action), ROW_ALIGNMENT)
         text_len, video_len, video_cond_len, action_len, _ = request.lengths
         video_pe = request.rope[:, text_len : text_len + video_len]
         action_start = text_len + video_len + video_cond_len
         action_pe = request.rope[:, action_start : action_start + action_len]
         for block in self.content_mode_blocks[VIDEO]:
             video_value = block(video_value, video_pe, step.video_early, video_len)
-        for block in self.content_mode_blocks[ACTION]:
+        for block in self.content_mode_blocks[self.action]:
             action_value = block(action_value, action_pe, step.action_early, action_len)
         valid_streams = (
             request.text[:, :text_len],
@@ -982,9 +1038,13 @@ class FP8RInferenceDiT(nn.Module):
         offsets = (text_len, text_len + video_len + video_cond_len)
         video_hidden = self.final_layer[VIDEO].norm_final(sequence[:, offsets[0] : offsets[0] + video_len])
         video_hidden = video_hidden * step.final_video[1] + step.final_video[0]
-        action_hidden = self.final_layer[ACTION].norm_final(sequence[:, offsets[1] : offsets[1] + action_len])
+        action_hidden = self.final_layer[self.action].norm_final(
+            sequence[:, offsets[1] : offsets[1] + action_len]
+        )
         action_hidden = action_hidden * step.final_action[1] + step.final_action[0]
-        return self.final_layer[VIDEO].linear(video_hidden), self.final_layer[ACTION].linear(action_hidden)
+        return self.final_layer[VIDEO].linear(video_hidden), self.final_layer[self.action].linear(
+            action_hidden
+        )
 
     @torch.no_grad()
     def forward_prepared(

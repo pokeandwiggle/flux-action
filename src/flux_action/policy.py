@@ -52,17 +52,24 @@ OBS_STATE = "state"
 GRAY_LEVEL = 128  # the flat tile a dropped camera turns into
 
 
-def _released_inference_config(config: PolicyConfig) -> bool:
+def _released_architecture(config: PolicyConfig) -> bool:
+    """The released DiT trunk and sampler, with any action stream: what the FP8r backend serves."""
     return (
         config.torch_dtype == "bfloat16"
-        and config.action_modality == "action_prediction_droid"
-        and config.action_dim == 8
-        and config.chunk_size == 32
         and tuple(config.content_streams or ()) == ("video", "video_cond")
         and JointSingleSeqParams(**{**config.dit_config, "attn_mode": config.attn_mode})
         == JointSingleSeqParams(attn_mode=config.attn_mode)
         and config.inference_profile == "default"
         and config.sampler == "cosmos_unipc"
+    )
+
+
+def _released_inference_config(config: PolicyConfig) -> bool:
+    return (
+        _released_architecture(config)
+        and config.action_modality == "action_prediction_droid"
+        and config.action_dim == 8
+        and config.chunk_size == 32
     )
 
 
@@ -255,7 +262,7 @@ class FluxActionPolicy(nn.Module):
             state = {name.removeprefix("dit."): value for name, value in state.items()}
             from .models.transformer_inf_fp8r import FP8RInferenceDiT
 
-            policy.dit = FP8RInferenceDiT.from_quantized_state_dict(state)
+            policy.dit = FP8RInferenceDiT.from_quantized_state_dict(state, action=config.action_modality)
         else:
             policy.load_state_dict(state, strict=True, assign=True)
         return policy.to(target).eval()
@@ -277,8 +284,8 @@ class FluxActionPolicy(nn.Module):
             self.dit = BF16InferenceDiT.from_state_dict(self.dit.state_dict())
             self.reset()
         else:
-            assert _released_inference_config(self.config), (
-                "prepared backend requires released DROID geometry"
+            assert _released_architecture(self.config), (
+                "prepared backend requires the released DiT architecture and sampler"
             )
         self.dit.validate_runtime_device()
         if compile and self.dit._compiled_hot is None:
@@ -288,6 +295,21 @@ class FluxActionPolicy(nn.Module):
             self.video_vae.module.compile_encoder()
         self._inference_prepared = True
         return True
+
+    def quantize_fp8r(self) -> None:
+        """Quantize the reference DiT to native FP8r in place, as the released fp8r packages store it.
+
+        A fine-tune of the released architecture, with its own action stream, then serves through the FP8r
+        backend, real-time-chunking prefixes included. The policy is inference-only afterwards. Call it before
+        placement, then :meth:`prepare_inference`.
+        """
+        assert isinstance(self.dit, JointSingleSeq), "the DiT is already quantized or prepared"
+        assert _released_architecture(self.config), "FP8r requires the released DiT architecture and sampler"
+        from .models.transformer_inf_fp8r import FP8RInferenceDiT
+
+        self.dit = FP8RInferenceDiT.from_bf16_state_dict(self.dit.state_dict(), action=self.modality)
+        self.config.quantization = "fp8r"
+        self.reset()
 
     @property
     def video_vae(self):
@@ -805,7 +827,10 @@ class FluxActionPolicy(nn.Module):
                     f"(rtc_max_delay {cfg.rtc_max_delay}), got {tuple(prefix.shape)}"
                 )
             if self._inference_prepared:
-                raise NotImplementedError("action prefixes need the reference DiT, not a prepared backend")
+                from .models.transformer_inf_fp8r import FP8RInferenceDiT
+
+                if not isinstance(self.dit, FP8RInferenceDiT):
+                    raise NotImplementedError("action prefixes need the reference DiT or the FP8r backend")
         ak, ck = f"x_{m}", f"x_{m}_cond"
         device = cond["x_video_cond"].device
         rich_history = cfg.inference_profile == "history"
@@ -852,23 +877,41 @@ class FluxActionPolicy(nn.Module):
         }
         ctx_c = self._context(caption, device)
         ctx_uc = self._context("", device) if any(g != 1.0 for g in guidance.values()) else None
-
-        if self._inference_prepared:
-            return (
-                self._sample_prepared(
-                    flow=flow,
-                    fixed=fixed,
-                    caption=caption,
-                    ctx_c=ctx_c,
-                    ctx_uc=ctx_uc,
-                    guidance=guidance,
-                )[ak][0].float()
-                / cfg.action_scale
-            )
-
-        assert isinstance(self.dit, JointSingleSeq), "call prepare_inference before prediction"
         d = 0 if prefix is None else prefix.shape[0]
         pinned = None if prefix is None else (prefix.to(device, torch.float32) * cfg.action_scale)[None]
+
+        if self._inference_prepared:
+            out = self._sample_prepared(
+                flow=flow,
+                fixed=fixed,
+                caption=caption,
+                ctx_c=ctx_c,
+                ctx_uc=ctx_uc,
+                guidance=guidance,
+                pinned=pinned,
+            )
+        else:
+            out = self._sample_reference(flow, fixed, ctx_c, ctx_uc, guidance, pinned)
+        targets = out[ak][0].float() / cfg.action_scale
+        if prefix is not None:
+            targets[:d] = prefix.to(targets.device, torch.float32)
+        return targets
+
+    def _sample_reference(
+        self,
+        flow: dict[str, Tensor],
+        fixed: dict[str, Tensor],
+        ctx_c: tuple[Tensor, Tensor],
+        ctx_uc: tuple[Tensor, Tensor] | None,
+        guidance: dict[str, float],
+        pinned: Tensor | None,
+    ) -> dict[str, Tensor]:
+        """Run the configured solver over the reference DiT."""
+        assert isinstance(self.dit, JointSingleSeq), "call prepare_inference before prediction"
+        cfg, mdt = self.config, self.dtype_
+        ak = f"x_{self.modality}"
+        device = flow["x_video"].device
+        d = 0 if pinned is None else pinned.shape[1]
 
         def predict(samples: dict[str, Tensor], t) -> dict[str, Tensor]:
             t = float(t) / 1000.0 if isinstance(t, Tensor) and not t.is_floating_point() else float(t)
@@ -897,15 +940,10 @@ class FluxActionPolicy(nn.Module):
             return {k: v.float() for k, v in pred.items()}
 
         if cfg.sampler == "cosmos_unipc":
-            out = sampling.cosmos_unipc_order2(
+            return sampling.cosmos_unipc_order2(
                 flow, predict, n_steps=cfg.num_inference_steps, shift=cfg.sampler_shift
             )
-        else:
-            out = sampling.euler(flow, predict, n_steps=cfg.num_inference_steps, alpha=cfg.sampler_shift)
-        targets = out[ak][0].float() / cfg.action_scale
-        if prefix is not None:
-            targets[:d] = prefix.to(targets.device, torch.float32)
-        return targets
+        return sampling.euler(flow, predict, n_steps=cfg.num_inference_steps, alpha=cfg.sampler_shift)
 
     def _prepared_text(self, caption: str, ctx: tuple[Tensor, Tensor], vector: Tensor):
         cached = self._prepared_text_cache.get(caption)
@@ -923,8 +961,13 @@ class FluxActionPolicy(nn.Module):
         ctx_c: tuple[Tensor, Tensor],
         ctx_uc: tuple[Tensor, Tensor] | None,
         guidance: dict[str, float],
+        pinned: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """Run the existing solver over an optimized prepared DROID DiT."""
+        """Run the existing solver over an optimized prepared DiT.
+
+        ``pinned`` ``(1, d, D)``, a real-time-chunking prefix in model units, replaces the first ``d`` action
+        tokens before every call, which modulates them as clean (FP8r only).
+        """
         cfg, model = self.config, self.dit
         action_key = f"x_{self.modality}"
         cond_key = f"{action_key}_cond"
@@ -946,20 +989,33 @@ class FluxActionPolicy(nn.Module):
         negative_request = prepare("", ctx_uc) if ctx_uc is not None else None
         _, ticks = sampling.cosmos_unipc_schedule(cfg.num_inference_steps, cfg.sampler_shift)
         times = ticks.to(device=self.device, dtype=torch.float32) / 1000.0
-        steps = model.prepare_steps(request, times, times)
+        d = 0 if pinned is None else pinned.shape[1]
+        steps = (
+            model.prepare_steps(request, times, times, clean_action_tokens=d)
+            if d
+            else model.prepare_steps(request, times, times)
+        )
         phase = 0
 
         def predict(samples: dict[str, Tensor], _t) -> dict[str, Tensor]:
             nonlocal phase
+            if pinned is not None:
+                samples = {**samples, action_key: torch.cat([pinned, samples[action_key][:, d:]], dim=1)}
             inputs = {
                 "video": samples["x_video"].to(torch.bfloat16),
                 "action": samples[action_key].to(torch.bfloat16),
             }
+
+            def forward(prepared) -> dict[str, Tensor]:
+                # Keyed by this policy's action stream, which a fine-tune names itself.
+                prediction = model.forward_prepared(prepared, steps[phase], **inputs)
+                return {"x_video": prediction.video, action_key: prediction.action}
+
             if negative_request is None:
-                result = model.forward_prepared(request, steps[phase], **inputs).as_dict()
+                result = forward(request)
             else:
-                negative = model.forward_prepared(negative_request, steps[phase], **inputs).as_dict()
-                positive = model.forward_prepared(request, steps[phase], **inputs).as_dict()
+                negative = forward(negative_request)
+                positive = forward(request)
                 result = {
                     key: negative[key] + guidance[key] * (positive[key] - negative[key]) for key in flow
                 }
