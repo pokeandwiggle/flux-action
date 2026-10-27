@@ -687,7 +687,7 @@ class FluxActionPolicy(nn.Module):
             timesteps = torch.sigmoid(torch.randn(n) * cfg.video_logit_std + cfg.video_logit_mean)
         prefix_mask = None
         if cfg.rtc_max_delay and self.training:
-            delays = packing.sample_rtc_delays(n, cfg.rtc_max_delay)
+            delays = packing.sample_rtc_delays(n, cfg.rtc_max_delay, cfg.rtc_delay_probs)
             action_timesteps = packing.prefix_timesteps(action_timesteps, delays, cfg.chunk_size)
             prefix_mask = packing.prefix_loss_mask(delays, cfg.chunk_size)
         kwargs, targets, _ = packing.build_forward_kwargs(

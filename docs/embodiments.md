@@ -31,8 +31,10 @@ latents and is off by default; retain the setting used by your checkpoint.
 ## Real-time chunking
 
 A robot that replans while it still executes the previous chunk has already committed to its first few
-actions. **`rtc_max_delay`** trains for that: each window draws `d` uniformly from `0..rtc_max_delay`,
-keeps its first `d` action tokens clean (timestep 0) and leaves them out of the loss. At inference,
+actions. **`rtc_max_delay`** trains for that: each window draws `d` from `0..rtc_max_delay`,
+keeps its first `d` action tokens clean (timestep 0) and leaves them out of the loss. `d` is uniform unless
+**`rtc_delay_probs`** gives one probability per delay; a server that always pins `rtc_max_delay` actions trains
+best on that delay and on 0 alone, e.g. `[0.75, 0, …, 0, 0.25]`. At inference,
 `predict_action_chunk(batch, action_prefix=...)` takes those committed commands, `(B, d, D)` in dataset units
 with `d <= rtc_max_delay`; every denoiser call sees them clean and the chunk returns them unchanged. It needs
 the absolute action parameterization, and either the reference transformer (an unprepared policy) or the FP8r

@@ -119,11 +119,14 @@ class PolicyConfig:
     video_logit_mean: float = 1.08
     video_logit_std: float = 1.0
     conditioning_noise_max: float = 0.0
-    # Train-time real-time chunking: each training window draws d uniformly from 0..rtc_max_delay, keeps its
+    # Train-time real-time chunking: each training window draws a delay d from 0..rtc_max_delay, keeps its
     # first d action tokens clean (timestep 0, the clean end of the schedule) and leaves them out of the loss.
     # Inference may then pin up to rtc_max_delay already-committed actions (``action_prefix``) and denoise the
     # rest of the chunk around them. 0 trains and serves without prefixes.
     rtc_max_delay: int = 0
+    # How d is drawn: entry i is the probability of delay i, rtc_max_delay + 1 entries. None draws uniformly.
+    # A server that always pins the same delay trains best on that delay and 0 alone, e.g. [0.75, 0, ..., 0.25].
+    rtc_delay_probs: list[float] | None = None
     loss_reduction: str = "joint_tokens"
     action_channel_weights: list[float] | None = None
     action_loss_weight: float = 50.0
@@ -161,6 +164,17 @@ class PolicyConfig:
             raise ValueError("rtc_max_delay must be at least zero and shorter than the chunk")
         if self.rtc_max_delay and self.inference_profile != "default":
             raise ValueError("rtc_max_delay requires the default inference profile")
+        if self.rtc_delay_probs is not None:
+            probs = self.rtc_delay_probs
+            if (
+                not self.rtc_max_delay
+                or len(probs) != self.rtc_max_delay + 1
+                or any(not math.isfinite(p) or p < 0 for p in probs)
+                or not math.isclose(sum(probs), 1.0, abs_tol=1e-6)
+            ):
+                raise ValueError(
+                    "rtc_delay_probs must hold rtc_max_delay + 1 nonnegative finite probabilities summing to one"
+                )
         if (
             not math.isfinite(self.video_logit_mean)
             or not math.isfinite(self.video_logit_std)

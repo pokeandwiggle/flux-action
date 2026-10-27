@@ -410,9 +410,19 @@ def sample_timesteps(
     return rational_time_shift(t, shift)
 
 
-def sample_rtc_delays(batch: int, max_delay: int, generator: torch.Generator | None = None) -> Tensor:
-    """Train-time real-time chunking: one prefix length ``d`` per sample, uniform over ``0..max_delay``."""
-    return torch.randint(0, max_delay + 1, (batch,), generator=generator)
+def sample_rtc_delays(
+    batch: int,
+    max_delay: int,
+    probs: list[float] | None = None,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Train-time real-time chunking: one prefix length ``d`` per sample over ``0..max_delay``, drawn with
+    ``probs[d]`` (``max_delay + 1`` entries), or uniformly without ``probs``."""
+    if probs is None:
+        return torch.randint(0, max_delay + 1, (batch,), generator=generator)
+    weights = torch.tensor(probs, dtype=torch.float64)
+    assert weights.shape == (max_delay + 1,), "one probability per delay 0..max_delay"
+    return torch.multinomial(weights, batch, replacement=True, generator=generator)
 
 
 def prefix_timesteps(t: Tensor, delays: Tensor, chunk: int) -> Tensor:

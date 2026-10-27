@@ -422,6 +422,7 @@ class Trainer:
             "video_logit_std",
             "conditioning_noise_max",
             "rtc_max_delay",
+            "rtc_delay_probs",
             "loss_reduction",
             "action_channel_weights",
             "action_loss_weight",

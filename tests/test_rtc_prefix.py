@@ -140,3 +140,36 @@ def test_a_prefix_longer_than_trained_is_refused(batch):
 def test_rtc_max_delay_must_leave_actions_to_predict(delay):
     with pytest.raises(ValueError, match="rtc_max_delay"):
         tiny_config(rtc_max_delay=delay)
+
+
+def test_delay_probs_draw_only_the_delays_they_weight():
+    delays = packing.sample_rtc_delays(4000, 8, [0.75] + [0.0] * 7 + [0.25], torch.Generator().manual_seed(0))
+    assert set(delays.tolist()) == {0, 8}
+    assert (delays == 8).float().mean().item() == pytest.approx(0.25, abs=0.03)
+
+
+def test_training_draws_delays_from_the_configured_probs(batch):
+    torch.manual_seed(3)
+    policy = make_policy(tiny_config(rtc_max_delay=8, rtc_delay_probs=[0.0] * 8 + [1.0])).train()
+    spy = DitSpy(policy)
+    batch = {
+        k: (v.repeat(4, *([1] * (v.ndim - 1))) if isinstance(v, torch.Tensor) else v * 4)
+        for k, v in batch.items()
+    }
+    policy(batch)
+    timesteps = spy.calls[0]["x_action_timesteps"].reshape(4, CHUNK)
+    assert ((timesteps == 0).sum(-1) == 8).all()
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rtc_max_delay": 0, "rtc_delay_probs": [1.0]},
+        {"rtc_max_delay": 4, "rtc_delay_probs": [0.75, 0.25]},
+        {"rtc_max_delay": 1, "rtc_delay_probs": [0.5, 0.25]},
+        {"rtc_max_delay": 1, "rtc_delay_probs": [1.5, -0.5]},
+    ],
+)
+def test_rtc_delay_probs_must_weight_every_trained_delay(overrides):
+    with pytest.raises(ValueError, match="rtc_delay_probs"):
+        tiny_config(**overrides)
