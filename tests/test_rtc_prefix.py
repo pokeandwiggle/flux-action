@@ -168,6 +168,8 @@ def test_training_draws_delays_from_the_configured_probs(batch):
         {"rtc_max_delay": 4, "rtc_delay_probs": [0.75, 0.25]},
         {"rtc_max_delay": 1, "rtc_delay_probs": [0.5, 0.25]},
         {"rtc_max_delay": 1, "rtc_delay_probs": [1.5, -0.5]},
+        # Inference pins up to rtc_max_delay actions, so that delay has to be trained.
+        {"rtc_max_delay": 2, "rtc_delay_probs": [0.5, 0.5, 0.0]},
     ],
 )
 def test_rtc_delay_probs_must_weight_every_trained_delay(overrides):

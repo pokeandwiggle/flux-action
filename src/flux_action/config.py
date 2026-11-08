@@ -124,7 +124,8 @@ class PolicyConfig:
     # Inference may then pin up to rtc_max_delay already-committed actions (``action_prefix``) and denoise the
     # rest of the chunk around them. 0 trains and serves without prefixes.
     rtc_max_delay: int = 0
-    # How d is drawn: entry i is the probability of delay i, rtc_max_delay + 1 entries. None draws uniformly.
+    # How d is drawn: entry i is the probability of delay i, rtc_max_delay + 1 entries, the last positive because
+    # inference pins up to rtc_max_delay actions. None draws uniformly.
     # A server that always pins the same delay trains best on that delay and 0 alone, e.g. [0.75, 0, ..., 0.25].
     rtc_delay_probs: list[float] | None = None
     loss_reduction: str = "joint_tokens"
@@ -171,9 +172,11 @@ class PolicyConfig:
                 or len(probs) != self.rtc_max_delay + 1
                 or any(not math.isfinite(p) or p < 0 for p in probs)
                 or not math.isclose(sum(probs), 1.0, abs_tol=1e-6)
+                or not probs[-1] > 0
             ):
                 raise ValueError(
-                    "rtc_delay_probs must hold rtc_max_delay + 1 nonnegative finite probabilities summing to one"
+                    "rtc_delay_probs must hold rtc_max_delay + 1 nonnegative finite probabilities summing to one, "
+                    "the last positive: inference pins up to rtc_max_delay actions"
                 )
         if (
             not math.isfinite(self.video_logit_mean)
